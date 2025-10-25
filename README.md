@@ -685,7 +685,7 @@ Toluwani Oluwamuyiwa - goldenwritertolu@gmail.com
 
 For issues and questions:
 - Open an issue on GitHub
-- Contact: your.email@example.com
+- Contact: goldenwritertolu@gmail.com
 
 ---
 
