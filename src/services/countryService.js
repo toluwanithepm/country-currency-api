@@ -11,10 +11,10 @@ const STATUS_TABLE = 'status';
  * Calculates a new estimated GDP for a country.
  * @param {number} population
  * @param {number} exchangeRate
- * @returns {number} The calculated GDP.
+ * @returns {number|null} The calculated GDP.
  */
 function calculateGdp(population, exchangeRate) {
-    // FIX: If population is 0, we cannot estimate GDP. Return null.
+    // If population is 0, we cannot estimate GDP. Return null.
     if (population === 0 || exchangeRate === null || exchangeRate === 0) return null;
     
     // Generate random multiplier between 1000 and 2000
@@ -34,7 +34,8 @@ function calculateGdp(population, exchangeRate) {
 function processCountryData(externalCountries, rates) {
     const now = new Date().toISOString();
     
-    return externalCountries.map(country => {
+    // Use filter/map pipeline to process and then filter invalid results
+    const processed = externalCountries.map(country => {
         let currencyCode = null;
         let exchangeRate = null;
         let estimatedGdp = null;
@@ -42,7 +43,7 @@ function processCountryData(externalCountries, rates) {
         const population = country.population || 0; // Use 0 if missing
 
         // 1. Currency Handling
-        if (country.currencies && country.currencies.length > 0) {
+        if (country.currencies && Array.isArray(country.currencies) && country.currencies.length > 0) {
             currencyCode = country.currencies[0].code;
             
             // 2. Exchange Rate & GDP Calculation
@@ -62,6 +63,14 @@ function processCountryData(externalCountries, rates) {
             estimatedGdp = null; 
         }
 
+        // Check for required data integrity *before* upserting
+        if (!country.name || population === 0 || !currencyCode) {
+            // Return null if mandatory fields are missing/invalid
+            console.warn(`Skipping country due to missing essential data: Name: ${country.name}, Pop: ${population}, Code: ${currencyCode}`);
+            return null;
+        }
+
+
         // 3. Prepare final object for DB
         return {
             name: country.name,
@@ -75,74 +84,96 @@ function processCountryData(externalCountries, rates) {
             last_refreshed_at: now
         };
     });
+
+    // Filter out null entries created by the validation check above
+    return processed.filter(c => c !== null);
 }
 
 /**
  * Fetches data from external APIs, processes it, and updates the database cache.
  */
 async function refreshCache() {
-    // 1. Fetch External Data
-    const [countriesData, exchangeRates] = await Promise.all([
-        fetchCountries(),
-        fetchExchangeRates()
-    ]);
-    
-    // 2. Process Data
-    const processedCountries = processCountryData(countriesData, exchangeRates);
-    const now = new Date().toISOString();
+    console.log("Starting cache refresh..."); // Added logging
+    try {
+        // 1. Fetch External Data
+        const [countriesData, exchangeRates] = await Promise.all([
+            fetchCountries(),
+            fetchExchangeRates()
+        ]);
+        
+        // 2. Process Data and filter invalid records
+        const processedCountries = processCountryData(countriesData, exchangeRates);
+        const now = new Date().toISOString();
 
-    // 3. Perform Upsert (Update or Insert) using PostgreSQL's ON CONFLICT
-    const { error: upsertError } = await supabase
-        .from(COUNTRIES_TABLE)
-        .upsert(processedCountries, {
-            onConflict: 'name', 
-            ignoreDuplicates: false
-        });
+        if (processedCountries.length === 0) {
+            console.warn("No valid countries found after processing. Aborting upsert.");
+            throw new CustomError('No valid country data to save after processing.', 500);
+        }
 
-    if (upsertError) {
-        console.error("Database Upsert Error:", upsertError);
-        throw new CustomError('Database operation failed during refresh', 500);
+        // 3. Perform Upsert (Update or Insert) using PostgreSQL's ON CONFLICT
+        console.log(`Attempting to upsert ${processedCountries.length} records...`); // Added logging
+        const { error: upsertError } = await supabase
+            .from(COUNTRIES_TABLE)
+            .upsert(processedCountries, {
+                onConflict: 'name', 
+                ignoreDuplicates: false
+            });
+
+        if (upsertError) {
+            // CRITICAL LOGGING: Now included to debug database failures
+            console.error('--- Database Upsert Error ---');
+            console.error('Supabase Error Code:', upsertError.code);
+            console.error('Supabase Error Details:', upsertError.details);
+            console.error('Supabase Error Message:', upsertError.message);
+            console.error('-----------------------------');
+            throw new CustomError('Database operation failed during refresh', 500);
+        }
+        
+        // 4. Update Global Status
+        const { count, error: countError } = await supabase
+            .from(COUNTRIES_TABLE)
+            .select('*', { count: 'exact', head: true });
+
+        if (countError) {
+            console.error("Database Count Error:", countError);
+            throw new CustomError('Failed to count countries after refresh', 500);
+        }
+
+        const { data: statusData, error: statusError } = await supabase
+            .from(STATUS_TABLE)
+            .upsert({ 
+                id: 1, 
+                total_countries: count, 
+                last_refreshed_at: now 
+            })
+            .select()
+            .single();
+        
+        if (statusError) {
+            console.error("Database Status Update Error:", statusError);
+            throw new CustomError('Failed to update global status', 500);
+        }
+
+        // 5. Generate Summary Image (Async, does not block response)
+        const { data: top5, error: top5Error } = await supabase
+            .from(COUNTRIES_TABLE)
+            .select('*')
+            .not('estimated_gdp', 'is', null) // <-- Filter is still here
+            .order('estimated_gdp', { ascending: false })
+            .limit(5);
+
+        if (!top5Error && statusData) {
+            generateSummaryImage(top5, statusData);
+        }
+
+        console.log(`Cache refresh complete. Total countries: ${count}`); // Added logging
+        return { total_countries: count, last_refreshed_at: now };
+
+    } catch (err) {
+        // Re-throw the error for the controller to handle
+        console.error("Cache Refresh Fatal Error:", err.message); // Added logging
+        throw err;
     }
-    
-    // 4. Update Global Status
-    const { count, error: countError } = await supabase
-        .from(COUNTRIES_TABLE)
-        .select('*', { count: 'exact', head: true });
-
-    if (countError) {
-        console.error("Database Count Error:", countError);
-        throw new CustomError('Failed to count countries after refresh', 500);
-    }
-
-    const { data: statusData, error: statusError } = await supabase
-        .from(STATUS_TABLE)
-        .upsert({ 
-            id: 1, 
-            total_countries: count, 
-            last_refreshed_at: now 
-        })
-        .select()
-        .single();
-    
-    if (statusError) {
-        console.error("Database Status Update Error:", statusError);
-        throw new CustomError('Failed to update global status', 500);
-    }
-
-    // 5. Generate Summary Image (Async, does not block response)
-    // FIX: Explicitly filter out NULL GDPs for the top 5 image data.
-    const { data: top5, error: top5Error } = await supabase
-        .from(COUNTRIES_TABLE)
-        .select('*')
-        .not('estimated_gdp', 'is', null) // <-- Added filter
-        .order('estimated_gdp', { ascending: false }) // nullsLast is no longer strictly necessary, but we'll remove it for clarity since we are filtering.
-        .limit(5);
-
-    if (!top5Error && statusData) {
-        generateSummaryImage(top5, statusData);
-    }
-
-    return { total_countries: count, last_refreshed_at: now };
 }
 
 /**
@@ -206,7 +237,7 @@ async function getCountries({ region, currency, sort }) {
         // Apply sort order (nullsLast is no longer needed since we filter NULLs for GDP sort)
         query = query.order(sortColumn, { ascending, nullsLast: (field !== 'gdp') }); 
     } else {
-         // Default sort
+        // Default sort
         query = query.order('name', { ascending: true });
     }
 
